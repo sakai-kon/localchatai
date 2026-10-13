@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>ブラウザ内チャット</title>
+<style>
+:root{--bg:#f7f8f6;--fg:#1d2327;--mut:#68727a;--card:#fff;--bd:#dde2e0;--acc:#0f766e;--accfg:#fff;--warn:#fff4e0;--warnbd:#f0c36d}
+@media(prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#12171a;--fg:#e6ebe9;--mut:#8d9a96;--card:#1b2226;--bd:#2b353a;--acc:#2dd4bf;--accfg:#06201c;--warn:#2a2415;--warnbd:#6b5a22}}
+:root[data-theme="dark"]{--bg:#12171a;--fg:#e6ebe9;--mut:#8d9a96;--card:#1b2226;--bd:#2b353a;--acc:#2dd4bf;--accfg:#06201c;--warn:#2a2415;--warnbd:#6b5a22}
+*{box-sizing:border-box}
+:root{padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--fg);font:16px/1.65 -apple-system,BlinkMacSystemFont,"Hiragino Sans","Noto Sans JP",sans-serif;display:flex;flex-direction:column;padding:0 env(safe-area-inset-right,0px) 0 env(safe-area-inset-left,0px)}
+header{padding:10px 16px 6px;display:flex;align-items:center;gap:8px}
+h1{font-size:1rem;margin:0;font-weight:700;flex:1}
+.sm{font-size:.8rem;padding:6px 10px;border-radius:999px;background:transparent;color:var(--fg);border:1px solid var(--bd);font-weight:500}
+#stat{padding:0 16px 8px;font-size:.8rem;color:var(--mut);border-bottom:1px solid var(--bd)}
+#bar{height:3px;background:var(--bd)}#bar i{display:block;height:100%;width:0;background:var(--acc);transition:width .2s}
+#banner{margin:10px 16px 0;padding:10px 12px;border-radius:12px;background:var(--warn);border:1px solid var(--warnbd);font-size:.9rem;max-width:720px;width:calc(100% - 32px);align-self:center}
+#banner p{margin:0 0 8px}#banner small{display:block;color:var(--mut);margin-top:6px;overflow-wrap:anywhere}
+#banner .row{display:flex;gap:8px;flex-wrap:wrap}
+#log{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:12px;max-width:720px;width:100%;margin:0 auto}
+.m{padding:10px 14px;border-radius:14px;max-width:85%;white-space:pre-wrap;overflow-wrap:anywhere}
+.me{align-self:flex-end;background:var(--acc);color:var(--accfg)}
+.ai{align-self:flex-start;background:var(--card);border:1px solid var(--bd)}
+.note{align-self:center;color:var(--mut);font-size:.85rem;text-align:center;max-width:100%}
+#chips{display:flex;gap:8px;flex-wrap:wrap;justify-content:center}
+#box{display:flex;gap:8px;padding:10px 16px 12px;max-width:720px;width:100%;margin:0 auto;align-items:flex-end}
+textarea{flex:1;resize:none;font:inherit;font-size:16px;padding:10px 12px;border:1px solid var(--bd);border-radius:12px;background:var(--card);color:var(--fg);max-height:140px}
+button{font:inherit;border:0;border-radius:12px;padding:10px 16px;background:var(--acc);color:var(--accfg);font-weight:700;cursor:pointer}
+button.sec{background:transparent;color:var(--fg);border:1px solid var(--bd);font-weight:500}
+button:disabled,textarea:disabled{opacity:.5;cursor:default}
+:focus-visible{outline:2px solid var(--acc);outline-offset:2px}
+[hidden]{display:none!important}
+</style>
+</head>
+<body>
+<header>
+  <h1>ブラウザ内チャット</h1>
+  <button class="sm" id="mode" hidden></button>
+  <button class="sm" id="new">新しい会話</button>
+</header>
+<div id="stat"></div>
+<div id="bar"><i></i></div>
+<div id="banner" hidden></div>
+<div id="log"></div>
+<div id="box">
+  <textarea id="in" rows="1" placeholder="メッセージを入力（Shift+Enterで改行）" disabled></textarea>
+  <button id="go" disabled>送信</button>
+</div>
+
+<script type="module">
+const TJS = "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1";
+const MODEL = "onnx-community/Qwen2.5-0.5B-Instruct";
+const SYSTEM = "あなたは親切なアシスタントです。日本語で、簡潔にプレーンテキストで答えてください。";
+const EXAMPLES = ["自己紹介をして", "「明日までに資料をください」を丁寧な文に直して", "元気が出る一言をちょうだい"];
+
+const $ = (s) => document.querySelector(s);
+const log = $("#log"), input = $("#in"), go = $("#go"), stat = $("#stat"), bar = $("#bar i");
+const banner = $("#banner"), modeBtn = $("#mode"), newBtn = $("#new");
+
+let mode = "local", tjs = null, gen = null, sample = null;
+let busy = false, loading = false, stopped = false, stop = null, progressText = "";
+let history = [];
+
+const errText = (e) => String((e && (e.message || e.code)) || e);
+const isNet = (e) => /fetch|network|load failed|cors|csp|content security|failed to load|import/i.test(errText(e));
+const isMem = (e) => /memory|alloc|oom|out of/i.test(errText(e));
+const ready = () => (mode === "local" ? !!gen : !!sample);
+const pin = () => { log.scrollTop = log.scrollHeight; };
+
+function refresh() {
+  input.disabled = busy || !ready();
+  go.disabled = !busy && !ready();
+  go.textContent = busy ? "停止" : "送信";
+  input.placeholder = ready() ? "メッセージを入力（Shift+Enterで改行）" : (mode === "local" ? "モデルを準備しています…" : "Claudeに接続できません");
+  modeBtn.hidden = !sample;
+  modeBtn.textContent = mode === "local" ? "端末内モデル" : "Claude";
+  modeBtn.title = "応答するモデルを切り替え";
+  stat.textContent = mode === "claude" ? "Claudeが応答中（会話は端末外で処理されます）"
+    : gen ? "端末内で動作中（会話は外部に送信されません）"
+    : loading ? (progressText || "モデルを準備しています") : "モデルは未読み込みです";
+}
+
+function showBanner(msg, actions = [], detail = "") {
+  banner.replaceChildren();
+  const p = document.createElement("p"); p.textContent = msg; banner.append(p);
+  const row = document.createElement("div"); row.className = "row";
+  for (const a of actions.filter(Boolean)) {
+    const b = document.createElement("button"); b.className = "sec"; b.textContent = a[0];
+    b.onclick = a[1]; row.append(b);
+  }
+  if (row.children.length) banner.append(row);
+  if (detail) { const s = document.createElement("small"); s.textContent = "詳細: " + detail; banner.append(s); }
+  banner.hidden = false;
+}
+const hideBanner = () => { banner.hidden = true; };
+
+function add(cls, text) {
+  const d = document.createElement("div");
+  d.className = "m " + cls; d.textContent = text;
+  log.append(d); pin(); return d;
+}
+
+function intro() {
+  log.replaceChildren();
+  add("note", "初回だけモデル（約0.5GB）をダウンロードします。Wi-Fi環境がおすすめです。2回目以降は保存済みのモデルを使います。");
+  const c = document.createElement("div"); c.id = "chips";
+  for (const t of EXAMPLES) {
+    const b = document.createElement("button"); b.className = "sec sm"; b.textContent = t;
+    b.onclick = () => { input.value = t; grow(); input.focus(); };
+    c.append(b);
+  }
+  log.append(c);
+}
+
+async function gpuInfo() {
+  try {
+    if (!navigator.gpu) return { ok: false };
+    const a = await navigator.gpu.requestAdapter();
+    return a ? { ok: true, f16: a.features.has("shader-f16") } : { ok: false };
+  } catch { return { ok: false }; }
+}
+
+async function loadLocal() {
+  if (loading || gen) return;
+  loading = true; progressText = ""; bar.style.width = "0%"; refresh();
+  try { navigator.storage && navigator.storage.persist && navigator.storage.persist(); } catch {}
+  let lastErr;
+  try {
+    tjs = tjs || await import(TJS);
+    const g = await gpuInfo();
+    const plans = [];
+    if (g.ok && g.f16) plans.push(["webgpu", "q4f16"]);
+    if (g.ok) plans.push(["webgpu", "q4"]);
+    plans.push(["wasm", "q4"]); // q4f16 は WASM で不安定なため q4
+    for (const [device, dtype] of plans) {
+      const files = {};
+      try {
+        gen = await tjs.pipeline("text-generation", MODEL, {
+          device, dtype,
+          progress_callback: (p) => {
+            if (p.status !== "progress") return;
+            files[p.file] = { l: p.loaded, t: p.total };
+            const v = Object.values(files);
+            const t = v.reduce((a, b) => a + b.t, 0), l = v.reduce((a, b) => a + b.l, 0);
+            const pct = t ? Math.round((l / t) * 100) : 0;
+            bar.style.width = pct + "%";
+            progressText = `ダウンロード中 ${pct}%（${Math.round(l / 1e6)} / ${Math.round(t / 1e6)} MB）`;
+            if (!busy) refresh();
+          },
+        });
+        loading = false; bar.style.width = "100%";
+        if (mode === "local") hideBanner();
+        stat.dataset.dev = `${device}/${dtype}`;
+        refresh(); return;
+      } catch (e) { lastErr = e; if (isNet(e)) break; }
+    }
+  } catch (e) { lastErr = e; }
+  loading = false; bar.style.width = "0%"; refresh();
+  const net = isNet(lastErr);
+  const msg = net ? "モデルの取得先（huggingface.co）に接続できませんでした。通信状況や、広告ブロッカー・社内ネットワークの制限を確認してください。"
+    : isMem(lastErr) ? "メモリが足りず読み込めませんでした。他のタブやアプリを閉じてから、もう一度試してください。"
+    : "モデルを読み込めませんでした。";
+  if (sample) setMode("claude", false);
+  showBanner(msg + (sample ? " 代わりにClaudeで応答します。" : ""), [
+    ["もう一度試す", () => { hideBanner(); setMode("local"); }],
+  ], errText(lastErr));
+}
+
+function setMode(m, load = true) {
+  mode = m; refresh();
+  if (m === "local" && load && !gen && !loading) loadLocal();
+}
+
+const ctx = () => { const h = history.slice(-8); while (h.length && h[0].role !== "user") h.shift(); return h; };
+
+async function runLocal(on) {
+  let out = "";
+  stop = new tjs.InterruptableStoppingCriteria();
+  const streamer = new tjs.TextStreamer(gen.tokenizer, {
+    skip_prompt: true, skip_special_tokens: true,
+    callback_function: (t) => { out += t; on(out); },
+  });
+  await gen([{ role: "system", content: SYSTEM }, ...ctx()], {
+    max_new_tokens: 384, do_sample: true, temperature: 0.7, top_p: 0.9,
+    repetition_penalty: 1.1, streamer, stopping_criteria: stop,
+  });
+  return out;
+}
+
+async function runClaude(on) {
+  const ctrl = new AbortController(); stop = { interrupt: () => ctrl.abort() };
+  const msgs = ctx().map((m) => ({ ...m }));
+  msgs[0].content = SYSTEM + "\n\n" + msgs[0].content;
+  const r = await sample(msgs, { onText: ({ text }) => on(text), signal: ctrl.signal, cache: false });
+  return r.text;
+}
+
+async function send(text) {
+  text = (text ?? input.value).trim();
+  if (!text || busy || !ready()) return;
+  input.value = ""; grow(); $("#chips") && $("#chips").remove();
+  busy = true; stopped = false; refresh();
+  add("me", text); history.push({ role: "user", content: text });
+  const b = add("ai", "…"); let out = "";
+  const on = (t) => { out = t; b.textContent = t || "…"; pin(); };
+  try {
+    out = mode === "local" ? await runLocal(on) : await runClaude(on);
+  } catch (e) {
+    if (!stopped) {
+      history.pop();
+      const why = e && e.code === "not_granted" ? "Claudeの利用が許可されませんでした。"
+        : e && e.code === "rate_limited" ? "利用が集中しています。少し待ってからやり直してください。"
+        : isMem(e) ? "メモリが足りませんでした。他のタブを閉じてやり直してください。"
+        : "応答に失敗しました。";
+      b.className = "m note"; b.textContent = why + " ";
+      const r = document.createElement("button"); r.className = "sec sm"; r.textContent = "再送する";
+      r.onclick = () => { b.remove(); send(text); };
+      b.append(r);
+      busy = false; refresh(); return;
+    }
+  }
+  if (out.trim()) history.push({ role: "assistant", content: out });
+  else { history.pop(); b.className = "m note"; b.textContent = stopped ? "停止しました。" : "応答が空でした。もう一度送信してください。"; }
+  busy = false; refresh(); if (!input.disabled) input.focus();
+}
+
+function grow() { input.style.height = "auto"; input.style.height = Math.min(input.scrollHeight, 140) + "px"; }
+
+go.onclick = () => { if (busy) { stopped = true; stop && stop.interrupt(); } else send(); };
+input.addEventListener("input", grow);
+input.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); }
+});
+modeBtn.onclick = () => { if (!busy) { hideBanner(); setMode(mode === "local" ? "claude" : "local"); } };
+newBtn.onclick = () => { if (busy) return; history = []; intro(); input.focus(); };
+
+intro(); refresh(); loadLocal();
+(async () => {
+  try { if (window.claude) sample = await window.claude.use("sample"); } catch { sample = null; }
+  refresh();
+  if (sample && !gen && loading && banner.hidden) {
+    showBanner("モデルを準備しています。待たずにClaudeと話すこともできます。", [["Claudeで話す", () => { hideBanner(); setMode("claude"); }]]);
+  }
+})();
+</script>
+</body>
+</html>
